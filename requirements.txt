@@ -1,0 +1,51 @@
+# Install order matters for the verification stack: latex2sympy2 pins
+# antlr4-python3-runtime==4.7.2, but the generated parser under
+# eval_math_rule/evaluation/latex2sympy/gen was built with 4.9.3 and
+# math-verify requires >=4.9.3. Installing in the order below (and reinstalling
+# the antlr runtime last, with --no-deps) resolves to the combination the
+# released code was verified against.
+
+# --- Core -------------------------------------------------------------------
+torch==2.9.0
+transformers==4.57.6
+numpy==1.26.4
+tqdm
+regex
+
+# --- Steering-parameter extraction (hidden_analysis.py) ---------------------
+scikit-learn==1.7.2
+
+# --- Online constrained projection (--method projection) --------------------
+cvxpy==1.7.5
+cvxpylayers==0.1.9
+
+# --- Offline constrained projection (qp_offline.py) -------------------------
+pdaqp==0.7.0
+
+# --- Diagnostics (projection_analysis.py) -----------------------------------
+pandas
+scipy
+matplotlib
+
+# --- Answer verification (evaluator.py, generate_dataset_vllm.py) -----------
+latex2sympy2==1.9.1
+math-verify==0.9.0
+word2number==1.1
+sympy==1.14.0
+antlr4-python3-runtime==4.9.3
+
+# ---------------------------------------------------------------------------
+# vLLM MUST be the steer-vector fork bundled in EasySteer, not the PyPI
+# release. Install EasySteer separately, after applying
+# patches/easysteer-projection-algorithms.patch from the EasySteer repo root:
+#
+#   git clone https://github.com/ZJU-REAL/EasySteer
+#   cd EasySteer
+#   git apply -p1 /path/to/Opt4Reasoning/patches/easysteer-projection-algorithms.patch
+#   pip install -e .
+#
+# See patches/README.md for details. If your resolver rejects the combination
+# above, install EasySteer first, then this file, then run:
+#
+#   pip install --no-deps antlr4-python3-runtime==4.9.3
+# ---------------------------------------------------------------------------

@@ -1,0 +1,249 @@
+diff --git a/vllm-steer/vllm/steer_vectors/algorithms/__init__.py b/vllm-steer/vllm/steer_vectors/algorithms/__init__.py
+index 1a3e6cf6d..3be6094d9 100644
+--- a/vllm-steer/vllm/steer_vectors/algorithms/__init__.py
++++ b/vllm-steer/vllm/steer_vectors/algorithms/__init__.py
+@@ -16,4 +16,6 @@ from .lm_steer import LMSteerAlgorithm
+ from .moe_router import MoERouterAlgorithm
+ from .replace import ReplaceAlgorithm
+ from .erase import EraseAlgorithm
+-from .concept_replace import ConceptReplaceAlgorithm
+\ No newline at end of file
++from .concept_replace import ConceptReplaceAlgorithm
++from .projection import ProjectionAlgorithm
++from .projection_light import ProjectionOFFAlgorithm
+\ No newline at end of file
+diff --git a/vllm-steer/vllm/steer_vectors/algorithms/projection.py b/vllm-steer/vllm/steer_vectors/algorithms/projection.py
+new file mode 100644
+index 000000000..37b368986
+--- /dev/null
++++ b/vllm-steer/vllm/steer_vectors/algorithms/projection.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++from typing import Optional, Dict, Any, Tuple
++import torch
++import logging, json
++import cvxpy as cp
++from cvxpylayers.torch import CvxpyLayer
++import numpy as np
++
++from .template import AlgorithmTemplate
++from .factory import register_algorithm
++
++logger = logging.getLogger(__name__)
++
++
++@register_algorithm("projection")
++class ProjectionAlgorithm(AlgorithmTemplate):
++    """
++    Constrained-projection algorithm (online).
++
++    1. Map the hidden state into the PCA-reduced latent space.
++    2. Solve for the closest point to the origin that satisfies every SVC
++       constraint, using a CvxpyLayer.
++    3. Apply the resulting displacement back to the original hidden state.
++    """
++
++    def _create_steer_layer(self, qp_params: dict):
++        """Build the CVXPY layer: minimize ||x - target_pca||^2 subject to the SVC constraints."""
++        pca_components = qp_params["pca"]["components"]
++        dim = len(pca_components)
++        
++        x = cp.Variable(dim)
++        target_pca = cp.Parameter(dim)
++        
++        constraints = []
++        # One constraint per SVC: w^T x + b <= 0
++        for k, v in qp_params.items():
++            if "svc" in k:
++                # Convert to a cp constant once, outside the solve, for efficiency
++                coef = np.array(v["coef"]).flatten()
++                intercept = v["intercept"]
++                constraints.append(coef @ x + intercept <= 0.0)
++
++        prob = cp.Problem(cp.Minimize(cp.sum_squares(x - target_pca)), constraints)
++        # A layer callable from PyTorch that stays differentiable end to end
++        return CvxpyLayer(prob, parameters=[target_pca], variables=[x])
++
++    def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
++        """
++        Apply the projection intervention.
++
++        hidden_state is expected to have shape [batch, seq_len, hidden_dim].
++        """
++        qp_layer = params["qp_layer"]
++        pca_comp = params["pca_comp"]
++        s_mean = params["s_mean"]
++        scale_factor = params.get("scale_factor", 1.0)
++
++        dtype = hidden_state.dtype
++
++        # 1. Project into the PCA latent space -> [batch, hidden_dim] -> [batch, dim]
++        target_h = hidden_state
++        h_pca = (target_h - s_mean) @ pca_comp.T
++
++        # 2. Solve the QP. The layer expects a float32 [batch, dim] input; the
++        #    PCA parameters are already on the right device from load_from_path.
++        new_pca, = qp_layer(h_pca.to(torch.float32))
++        new_pca = new_pca.to(dtype)
++
++        # 3. Map the latent displacement back to the model's hidden space
++        delta_pca = new_pca - h_pca
++        steer_vec = delta_pca @ pca_comp
++
++        # 4. Apply the intervention, scaled by the steering strength
++        output = target_h + scale_factor * steer_vec
++
++        return output
++
++    @classmethod
++    def load_from_path(cls, file_path: str, device: str, config=None, target_layers=None):
++        """Load the PCA, scaler, and SVC parameters from a JSON file and build the optimization layer."""
++        try:
++            with open(file_path, 'rb') as f:
++                qp_params = json.load(f)
++
++            # Instantiate so the helper below can be called
++            instance = cls()
++
++            # Build the CvxpyLayer once and reuse it for every target layer
++            qp_layer = instance._create_steer_layer(qp_params).to(device)
++
++            # Tensors needed by _transform
++            s_mean = torch.tensor(qp_params["scaler"]["mean"]).float().to(device)
++            pca_comp = torch.tensor(qp_params["pca"]["components"]).float().to(device)
++
++            layer_payloads = {}
++            if target_layers is None:
++                target_layers = list(range(getattr(config, "num_hidden_layers", 48)))
++
++            for layer_idx in target_layers:
++                layer_payloads[layer_idx] = {
++                    "qp_layer": qp_layer,
++                    "pca_comp": pca_comp,
++                    "s_mean": s_mean
++                }
++
++            return {"layer_payloads": layer_payloads}
++
++        except Exception as e:
++            logger.error(f"Error loading projection parameters: {e}")
++            raise RuntimeError(f"Failed to load projection config from {file_path}") from e
+\ No newline at end of file
+diff --git a/vllm-steer/vllm/steer_vectors/algorithms/projection_light.py b/vllm-steer/vllm/steer_vectors/algorithms/projection_light.py
+new file mode 100644
+index 000000000..aae2c1b65
+--- /dev/null
++++ b/vllm-steer/vllm/steer_vectors/algorithms/projection_light.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++from typing import Optional, Dict, Any, Tuple
++import torch
++import logging, json
++import numpy as np
++
++from .template import AlgorithmTemplate
++from .factory import register_algorithm
++
++
++logger = logging.getLogger(__name__)
++
++
++@torch.compile(mode="max-autotune")
++def _compiled_qp_projection(target_h, pca_comp, s_mean, Ath, bth, K_all, k_all, scale_factor):
++    # target_h: [B, D]
++    h_pca = (target_h - s_mean) @ pca_comp.T
++
++    B = h_pca.size(0)
++    N, C, D = Ath.shape
++
++    # Point-location lookup, in FP32 so that the boundary tests are not
++    # perturbed by the model's lower-precision dtype.
++    h_pca_f32 = h_pca.to(torch.float32)
++    Ath_flat = Ath.view(-1, D)
++
++    A_theta = (h_pca_f32 @ Ath_flat.T).view(B, N, C)
++
++    # A region is active when all of its facet constraints hold
++    is_valid = A_theta <= (bth.unsqueeze(0))
++    valid_regions = is_valid.all(dim=-1) # [B, N]
++
++    has_valid = valid_regions.any(dim=-1) # [B]
++    region_idx = valid_regions.int().argmax(dim=1) # [B]
++
++    # Gather the affine solution (K, k) of the selected regions
++    K_sel = K_all[region_idx] # [B, D, D]
++    k_sel = k_all[region_idx] # [B, D]
++
++    new_pca_f32 = torch.bmm(K_sel, h_pca_f32.unsqueeze(2)).squeeze(2) + k_sel
++
++    # Cast back to the model's dtype, inferred from target_h
++    new_pca = new_pca_f32.to(target_h.dtype)
++    
++    delta_pca = new_pca - h_pca
++    delta_pca = torch.where(has_valid.unsqueeze(-1), delta_pca, torch.zeros_like(delta_pca))
++
++    steer_vec = delta_pca @ pca_comp
++    return target_h + scale_factor * steer_vec
++
++@register_algorithm("projection-offline")
++class ProjectionOFFAlgorithm(AlgorithmTemplate):
++    """
++    Constrained-projection algorithm (offline).
++
++    1. Offline: the SVC constraints are turned into an mpQP, which is solved
++       for every critical region (CR) and its affine solution (K, k). See
++       qp_offline.py.
++    2. Online: the region boundaries are stacked into dense tensors and a
++       fully vectorised GPU point-location over the whole batch finds each
++       hidden state's region, after which z = K * theta + k.
++    """
++
++    def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
++        original_shape = hidden_state.shape
++
++        # Flatten batch and seq_len into a single [B, hidden_dim] dimension
++        target_h = hidden_state.reshape(-1, original_shape[-1])
++
++        output_flat = _compiled_qp_projection(
++            target_h,
++            params["pca_comp"],
++            params["s_mean"],
++            params["Ath"],
++            params["bth"],
++            params["K"],
++            params["k"],
++            params.get("scale_factor", 1.0)
++        )
++
++        return output_flat.reshape(original_shape)
++
++    @classmethod
++    def load_from_path(cls, file_path: str, device: str, config=None, target_layers=None):
++        import os
++        try:
++            # Load the precomputed tensors straight onto the target device
++            tensors = torch.load(file_path, map_location=device, weights_only=True)
++
++            layer_payloads = {}
++            if target_layers is None:
++                target_layers = list(range(getattr(config, "num_hidden_layers", 48)))
++
++            # Share the same payload across every target layer. The region
++            # tensors are forced to float32 for the point-location lookup.
++            for layer_idx in target_layers:
++                layer_payloads[layer_idx] = {
++                    "Ath": tensors["Ath"].to(device).float(),
++                    "bth": tensors["bth"].to(device).float(),
++                    "K": tensors["K"].to(device).float(),
++                    "k": tensors["k"].to(device).float(),
++                    # PCA components stay in the model's dtype
++                    "pca_comp": tensors["pca_comp"].to(device),
++                    "s_mean": tensors["s_mean"].to(device)
++                }
++
++            return {"layer_payloads": layer_payloads}
++
++        except Exception as e:
++            logger.error(f"Error loading projection tensors: {e}")
++            raise RuntimeError(f"Failed to load compiled tensors from {file_path}") from e
+\ No newline at end of file

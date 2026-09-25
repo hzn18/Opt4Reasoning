@@ -1,0 +1,21 @@
+**/__pycache__/
+
+# Virtual environments and editor state (.*/ covers .easysteer, .venv, .claude, ...)
+.*/
+
+CLAUDE.md
+
+# Generated outputs
+results/
+temp/
+archive/
+params/archive
+
+# The vLLM fork used for steering is NOT vendored; see patches/README.md
+EasySteer/
+
+# LiveCodeBench is not part of this paper's evaluation
+data/livecodebench/
+
+# Evaluation harness for the code benchmarks, not used here
+code_evaluation/
