@@ -238,9 +238,13 @@ here. Use them with the `--steering_layer` / `--step_size` in the scripts.
 ## Citation
 
 ```bibtex
-@inproceedings{opt4reasoning2026efficient,
-  title     = {Efficient Reasoning via Constrained Optimization in Latent Space},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2026},
+@misc{hou2026efficientreasoningconstrainedoptimization,
+      title={Efficient Reasoning via Constrained Optimization in Latent Space}, 
+      author={Zhinan Hou and XingChen Li and Keyou You},
+      year={2026},
+      eprint={2609.34181},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2609.34181}, 
 }
 ```
